@@ -1,0 +1,285 @@
+package orchestrator
+
+import (
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/cyberverse/server/internal/agenttask"
+	"github.com/cyberverse/server/internal/character"
+)
+
+func TestComposeSystemPromptSeparatesGlobalAndRole(t *testing.T) {
+	got := composeSystemPrompt("全局规则", "角色设定")
+
+	if !strings.Contains(got, "【全局输出规范】\n全局规则") {
+		t.Fatalf("expected global section, got %q", got)
+	}
+	if !strings.Contains(got, "【角色设定】\n角色设定") {
+		t.Fatalf("expected role section, got %q", got)
+	}
+}
+
+func TestStandardSystemPromptUsesGlobalWithoutCharacter(t *testing.T) {
+	orch := New(nil, nil, nil, nil, nil)
+	session := NewSession("s1", ModeStandard, "")
+
+	got := orch.standardSystemPrompt(session)
+	if got != composeSystemPrompt(standardGlobalSystemPrompt, "") {
+		t.Fatalf("unexpected system prompt: %q", got)
+	}
+}
+
+func TestBuildVoiceLLMSessionConfigUsesPersonaAndOnlyOmniRolePrompt(t *testing.T) {
+	store, err := character.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	char, err := store.Create(&character.Character{
+		Name:          "晴天",
+		Description:   "日常聊天伙伴",
+		VoiceProvider: "qwen_omni",
+		VoiceType:     "Tina",
+		SpeakingStyle: "自然、简洁",
+		Personality:   "温和真诚",
+		SystemPrompt:  "你和用户像熟悉的朋友。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	orch := New(nil, nil, nil, nil, store)
+	session := NewSession("s1", ModeOmni, char.ID)
+
+	got := orch.buildVoiceLLMSessionConfig(session, "s1")
+	if got.Provider != "persona" {
+		t.Fatalf("expected persona provider, got %q", got.Provider)
+	}
+	if got.BotName != "晴天" || got.SpeakingStyle != "自然、简洁" {
+		t.Fatalf("expected voice-specific fields to stay separate, got %+v", got)
+	}
+	if got.CharacterID != char.ID || got.CharacterDir == "" {
+		t.Fatalf("expected character RAG identity fields, got %+v", got)
+	}
+	if got.SystemPrompt != "你和用户像熟悉的朋友。" {
+		t.Fatalf("expected omni mode to keep only the character prompt, got %q", got.SystemPrompt)
+	}
+	for _, unexpected := range []string{"【全局输出规范】", "默认简短", "角色描述：", "角色性格：", "说话风格："} {
+		if strings.Contains(got.SystemPrompt, unexpected) {
+			t.Fatalf("omni prompt should not contain %q: %q", unexpected, got.SystemPrompt)
+		}
+	}
+}
+
+func TestBuildVoiceLLMSessionConfigIncludesLiveHistoryOnReconnect(t *testing.T) {
+	store, err := character.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	char, err := store.Create(&character.Character{
+		Name:          "晴天",
+		VoiceProvider: "qwen_omni",
+		VoiceType:     "Tina",
+		SystemPrompt:  "你和用户像熟悉的朋友。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	orch := New(nil, nil, nil, nil, store)
+	session := NewSession("s1", ModeOmni, char.ID)
+	session.SetDialogContext([]DialogContextItem{
+		{Role: "user", Text: "上次我们聊到她喜欢睡前吃零食。", Timestamp: 1},
+		{Role: "assistant", Text: "我记得这个细节。", Timestamp: 2},
+	})
+	now := time.Date(2026, 5, 26, 0, 0, 0, 0, time.UTC)
+	session.AddMessage(ChatMessage{Role: "user", Content: "她睡前不洗脚，吃饭不擦嘴", Timestamp: now, TurnSeq: 1})
+	session.AddMessage(ChatMessage{Role: "assistant", Content: "你说的是她的生活习惯。", Timestamp: now.Add(time.Second), TurnSeq: 1})
+	session.AddMessage(ChatMessage{Role: "user", Content: "就是，快点说说她", Timestamp: now.Add(2 * time.Second), TurnSeq: 2})
+	session.AddMessage(ChatMessage{Role: "user", Content: "她，当前前面提到的她，你还有上下文吗", Timestamp: now.Add(3 * time.Second), TurnSeq: 3})
+
+	got := orch.buildVoiceLLMSessionConfigExcludingTurn(session, "s1", 3)
+	texts := make([]string, 0, len(got.DialogContext))
+	for _, item := range got.DialogContext {
+		texts = append(texts, item.Text)
+	}
+	joined := strings.Join(texts, "\n")
+	for _, want := range []string{
+		"上次我们聊到她喜欢睡前吃零食。",
+		"我记得这个细节。",
+		"她睡前不洗脚，吃饭不擦嘴",
+		"你说的是她的生活习惯。",
+		"就是，快点说说她",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("expected live reconnect context to contain %q, got %+v", want, got.DialogContext)
+		}
+	}
+	if strings.Contains(joined, "她，当前前面提到的她，你还有上下文吗") {
+		t.Fatalf("current text input should not be duplicated in dialog context: %+v", got.DialogContext)
+	}
+}
+
+func TestVoiceStartupGreetingUsesUnderlyingProviderAndNoFixedWelcome(t *testing.T) {
+	store, err := character.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	char, err := store.Create(&character.Character{
+		Name:           "晴天",
+		VoiceProvider:  "qwen_omni",
+		VoiceType:      "Tina",
+		SpeakingStyle:  "自然、简洁",
+		SystemPrompt:   "你和用户像熟悉的朋友。",
+		WelcomeMessage: "欢迎回来，我们继续聊。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	orch := New(nil, nil, nil, nil, store)
+	session := NewSession("s1", ModeOmni, char.ID)
+
+	normal := orch.buildVoiceLLMSessionConfig(session, "s1")
+	if normal.Provider != "persona" {
+		t.Fatalf("expected normal omni config to use persona, got %q", normal.Provider)
+	}
+	if normal.WelcomeMessage != "" {
+		t.Fatalf("expected fixed welcome to be withheld from normal voice config, got %q", normal.WelcomeMessage)
+	}
+
+	greeting := orch.buildVoiceStartupGreetingSessionConfig(session, "s1")
+	if greeting.Provider != "qwen_omni" {
+		t.Fatalf("expected startup greeting to use underlying provider, got %q", greeting.Provider)
+	}
+	if greeting.WelcomeMessage != "" {
+		t.Fatalf("expected startup greeting to disable provider SayHello, got %q", greeting.WelcomeMessage)
+	}
+}
+
+func TestBuildVoiceStartupGreetingPromptUsesHistory(t *testing.T) {
+	store, err := character.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	char, err := store.Create(&character.Character{
+		Name:           "晴天",
+		SpeakingStyle:  "自然、简洁",
+		SystemPrompt:   "你和用户像熟悉的朋友。",
+		WelcomeMessage: "见到你很高兴。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	orch := New(nil, nil, nil, nil, store)
+	session := NewSession("s1", ModeOmni, char.ID)
+	session.SetDialogContext([]DialogContextItem{
+		{Role: "user", Text: "上次我们在聊出差计划。", Timestamp: 1},
+		{Role: "assistant", Text: "我帮你整理了行程重点。", Timestamp: 2},
+	})
+
+	got := orch.buildVoiceStartupGreetingPrompt(session)
+	for _, want := range []string{
+		"你的名字：晴天",
+		"可参考的开场偏好：见到你很高兴。",
+		"用户：上次我们在聊出差计划。",
+		"你：我帮你整理了行程重点。",
+		"默认不要回顾、总结、复述或主动延续这些内容",
+		"不要主动提及取消、失败、争执、情绪化表达、敏感内容或具体历史细节",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected prompt to contain %q, got %q", want, got)
+		}
+	}
+	if strings.Contains(got, "可以自然提到上次关注的话题") {
+		t.Fatalf("expected startup greeting not to encourage routine history recall: %q", got)
+	}
+	if strings.Contains(got, "当前没有可用的历史对话") {
+		t.Fatalf("expected history prompt, got no-history branch: %q", got)
+	}
+}
+
+func TestBuildVoiceStartupGreetingPromptIntroducesSelfWithoutHistory(t *testing.T) {
+	store, err := character.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	char, err := store.Create(&character.Character{Name: "晴天"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	orch := New(nil, nil, nil, nil, store)
+	session := NewSession("s1", ModeOmni, char.ID)
+
+	got := orch.buildVoiceStartupGreetingPrompt(session)
+	for _, want := range []string{"你的名字：晴天", "当前没有可用的历史对话", "实时语音视频聊天", "查询、调研、整理资料"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected prompt to contain %q, got %q", want, got)
+		}
+	}
+}
+
+func TestBuildVoiceLLMSessionConfigUsesPersonaWhenAgentEnabled(t *testing.T) {
+	store, err := character.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	char, err := store.Create(&character.Character{
+		Name:          "晴天",
+		VoiceProvider: "qwen_omni",
+		VoiceType:     "Tina",
+		SystemPrompt:  "你和用户像熟悉的朋友。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	taskRoot := t.TempDir()
+	taskStore, err := agenttask.OpenStore(filepath.Join(taskRoot, "tasks.db"), filepath.Join(taskRoot, "artifacts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer taskStore.Close()
+
+	orch := New(nil, nil, nil, nil, store)
+	orch.SetTaskService(agenttask.NewService(taskStore, nil))
+	session := NewSession("s1", ModeOmni, char.ID)
+
+	got := orch.buildVoiceLLMSessionConfig(session, "s1")
+	if got.Provider != "persona" {
+		t.Fatalf("expected persona provider, got %q", got.Provider)
+	}
+	if !orch.sessionSupportsVisualInput(session) {
+		t.Fatal("expected qwen_omni visual support to use the underlying character provider")
+	}
+}
+
+func TestStandardSystemPromptWithRAGAppendsMaterialContext(t *testing.T) {
+	store, err := character.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	char, err := store.Create(&character.Character{
+		Name:         "晴天",
+		SystemPrompt: "你是晴天。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	orch := New(nil, nil, nil, nil, store)
+	session := NewSession("s1", ModeStandard, char.ID)
+
+	got := orch.standardSystemPromptWithRAG(session, "【角色素材检索结果】\n[1] 早年经历\n出生在海边。")
+	if !strings.Contains(got, "角色提示：你是晴天。") {
+		t.Fatalf("expected role prompt, got %q", got)
+	}
+	if !strings.Contains(got, "【角色素材检索结果】") || !strings.Contains(got, "出生在海边") {
+		t.Fatalf("expected RAG context, got %q", got)
+	}
+	if strings.Contains(got, "biography｜") {
+		t.Fatalf("expected material type label to be omitted, got %q", got)
+	}
+}

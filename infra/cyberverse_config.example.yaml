@@ -1,0 +1,237 @@
+# CyberVerse example configuration.
+# Copy this file to cyberverse_config.yaml and edit the local copy:
+#   cp infra/cyberverse_config.example.yaml cyberverse_config.yaml
+#
+# Keep secrets in .env. Values such as ${DASHSCOPE_API_KEY} are expanded from
+# environment variables after .env is loaded.
+
+server:
+    host: "0.0.0.0"
+    http_port: 8080
+    grpc_port: 50051
+    cors_origins: ["*"]
+
+livekit:
+    url: "${LIVEKIT_URL}"
+    api_key: "${LIVEKIT_API_KEY}"
+    api_secret: "${LIVEKIT_API_SECRET}"
+
+# Warm up inference components to reduce first-frame latency.
+warmup:
+    enabled: true
+    distributed:
+        enabled: true # Enable warmup in multi-GPU mode.
+        timeout_s: 30 # Timeout in seconds to prevent hangs.
+
+inference:
+    avatar:
+        # Set to false for pure voice sessions. Cached idle videos are still
+        # served, but realtime speaking video and new idle video generation stop.
+        enabled: true
+        # Select the avatar backend initialized by the inference process.
+        default: "flash_head"
+        # cached_video plays a pre-rendered standby MP4 while idle.
+        # silent_inference keeps one realtime avatar stream open and feeds idle audio.
+        idle_strategy: "silent_inference"
+        runtime:
+            # Used by scripts/inference.sh; world_size must match the visible GPU count.
+            cuda_visible_devices: 0 # Use 0,1 for two GPUs.
+            world_size: 1
+        flash_head:
+            plugin_class: "inference.plugins.avatar.flash_head_plugin.FlashHeadAvatarPlugin"
+            models_dir: "models"
+            checkpoint_dir: "./checkpoints/SoulX-FlashHead-1_3B"
+            wav2vec_dir: "./checkpoints/wav2vec2-base-960h"
+            model_type: "pro" # "pro" is higher quality; "lite" is faster/lower cost.
+            device: "cuda:0"
+            seed: 9999
+            # torch.compile can improve steady-state speed but may increase startup cost.
+            compile_model: true
+            compile_vae: true
+            # Keeps multi-GPU collectives off background Python threads.
+            dist_worker_main_thread: true
+            infer_params:
+                # These values define FlashHead's streaming window and output cadence.
+                frame_num: 33
+                motion_frames_latent_num: 2
+                tgt_fps: 20
+                sample_rate: 16000
+                sample_shift: 5
+                color_correction_strength: 1.0
+                cached_audio_duration: 8
+                num_heads: 12
+                height: 512
+                width: 512
+        live_act:
+            plugin_class: "inference.plugins.avatar.live_act_plugin.LiveActAvatarPlugin"
+            models_dir: "models/SoulX-LiveAct"
+            ckpt_dir: "./checkpoints/LiveAct"
+            wav2vec_dir: "./checkpoints/chinese-wav2vec2-base"
+            seed: 42
+            # Memory/performance switches. Enable offload/cache compression only when GPU memory is tight.
+            t5_cpu: false # When true, place the T5 text encoder on CPU to save GPU memory.
+            fp8_gemm: true # Use FP8 GEMM acceleration when supported (default).
+            fp4_gemm: false # Use FP4 GEMM on supported B-series GPUs; requires lightx2v_kernel (see README).
+            fp8_kv_cache: false
+            offload_cache: false
+            block_offload: false
+            mean_memory: false
+            # torch.compile for Wan/VAE decode; slower startup, may be unstable in some dev environments.
+            compile_wan_model: true # When true, torch.compile the Wan model; slower startup, may be unstable.
+            compile_vae_decode: true
+            dist_worker_main_thread: true
+            default_prompt: "一个人在说话"
+            infer_params:
+                size: "272*480" # width*height; real-time resolution achievable on PRO 6000
+                fps: 20
+                audio_cfg: 1.0 # Audio classifier-free guidance scale.
+
+    omni:
+        # Real realtime omni model providers only.
+        default: "qwen_omni"
+        doubao:
+            plugin_class: "inference.plugins.voice_llm.doubao_realtime.DoubaoRealtimePlugin"
+            access_token: "${DOUBAO_ACCESS_TOKEN}"
+            app_id: "${DOUBAO_APP_ID}"
+            voice_type: "zh_female_default"
+            # Avoid DialogAudioIdleTimeoutError before FlashHead's first chunk arrives.
+            enable_custom_vad: true # Required for end_smooth_window_ms to take effect.
+            end_smooth_window_ms: 6000
+        qwen_omni:
+            plugin_class: "inference.plugins.voice_llm.qwen_omni_realtime.QwenOmniRealtimePlugin"
+            api_key: "${DASHSCOPE_API_KEY}"
+            model: "qwen3.5-omni-flash-realtime"
+            voice: "Tina"
+            input_sample_rate: 16000
+            output_sample_rate: 24000
+            vad_type: "semantic_vad"
+            vad_threshold: 0.5 # VAD sensitivity; higher usually requires clearer speech.
+            vad_silence_duration_ms: 800 # Silence duration that ends a user turn.
+
+    persona:
+        # PersonaAgent is the orchestration layer. It wraps a concrete omni
+        # model provider and coordinates background tasks.
+        persona:
+            plugin_class: "inference.plugins.voice_llm.persona_agent.PersonaAgentPlugin"
+            # Use a provider whose adapter exposes native hidden tool calls.
+            # The qwen_omni adapter supports PersonaAgent task tools in this MVP.
+            model_provider: "qwen_omni"
+            # Defaults to data/tasks/langgraph_checkpoints.db when empty.
+            checkpoint_db_path: ""
+            llm:
+                # PersonaAgent owns the local Supervisor LangGraph and sub-agent
+                # runtime directly. Defaults to inference.llm.default; set this only
+                # when background tasks should use a different text LLM.
+                provider: "qwen"
+            tools:
+                zhihu:
+                    access_secret: "${ZHIHU_ACCESS_SECRET}"
+                    api_base: "https://developer.zhihu.com"
+                    timeout_seconds: 30
+                    zhida_model: "zhida-fast-1p5"
+            max_agent_iterations: 100 # Max local sub-agent loop iterations per task.
+
+    llm:
+        # Used by standard mode and by PersonaAgent's local sub-agent runtime.
+        # The global system prompt is owned by the Go orchestrator; do not
+        # duplicate persona prompts here.
+        default: "qwen"
+        qwen:
+            plugin_class: "inference.plugins.llm.qwen_plugin.QwenLLMPlugin"
+            api_key: "${DASHSCOPE_API_KEY}"
+            model: "qwen3.6-plus"
+            temperature: 0.7 # Sampling randomness for LLM output.
+            extra_body:
+                enable_thinking: false # Disable Qwen thinking mode for faster spoken replies.
+        openai:
+            plugin_class: "inference.plugins.llm.openai_plugin.OpenAILLMPlugin"
+            api_key: "${OPENAI_API_KEY}"
+            model: "gpt-4o"
+            temperature: 0.7 # Sampling randomness for LLM output.
+
+    embedding:
+        # Used by local character RAG indexes.
+        default: "qwen"
+        qwen:
+            api_key: "${DASHSCOPE_API_KEY}"
+            model: "text-embedding-v4"
+        openai:
+            api_key: "${OPENAI_API_KEY}"
+            model: "text-embedding-3-small"
+
+    tts:
+        # Used by standard mode after the LLM response is generated.
+        default: "qwen"
+        qwen:
+            plugin_class: "inference.plugins.tts.qwen_tts_plugin.QwenTTSPlugin"
+            api_key: "${DASHSCOPE_API_KEY}"
+            model: "qwen3-tts-flash-realtime"
+            voice: "Momo"
+            sample_rate: 24000
+            target_sample_rate: 16000 # Resampled rate sent to avatar models.
+        openai:
+            plugin_class: "inference.plugins.tts.openai_tts_plugin.OpenAITTSPlugin"
+            api_key: "${OPENAI_API_KEY}"
+            model: "tts-1"
+            voice: "nova"
+
+    asr:
+        # Used by standard mode to transcribe microphone input.
+        default: "qwen"
+        qwen:
+            plugin_class: "inference.plugins.asr.qwen_asr_plugin.QwenASRPlugin"
+            api_key: "${DASHSCOPE_API_KEY}"
+            model: "qwen3-asr-flash-realtime"
+            language: "auto" # Auto-detect language; set a code to force one.
+            sample_rate: 16000
+            vad_threshold: 0.8 # Speech detection sensitivity for ASR turns.
+            vad_silence_duration_ms: 600 # Silence duration that finalizes ASR text.
+        whisper:
+            plugin_class: "inference.plugins.asr.whisper_plugin.WhisperASRPlugin"
+            model_size: "base" # Whisper model size, such as base/small/medium.
+            language: "auto"
+            device: "cpu"
+
+session:
+    max_concurrent: 4
+    idle_timeout_s: 300
+    max_duration_s: 3600
+
+pipeline:
+    default_mode: "omni"
+    streaming_mode: "direct" # "direct" = P2P WebRTC, "livekit" = LiveKit SFU.
+    rag:
+        enabled: true
+        top_k: 5
+        min_score: 0.25 # Drop retrieval hits below this relevance score.
+        max_context_chars: 4500 # Max retrieved text injected into prompts.
+        chunk_chars: 900 # Target document chunk size during indexing.
+        chunk_overlap_chars: 120 # Overlap between adjacent indexed chunks.
+    visual_input:
+        enabled: true
+        frame_interval_ms: 1000 # Minimum interval between accepted visual frames.
+        max_width: 1280
+        max_height: 720
+        jpeg_quality: 0.78
+        max_frame_bytes: 524288 # Per-frame byte limit after compression.
+        ws_max_message_bytes: 1048576 # Max WebSocket message size for visual input.
+        max_recent_frames: 2
+        frame_ttl_ms: 10000 # Drop visual frames older than this.
+    turn_enabled: true
+    turn_port: 8443 # TCP port for embedded TURN server, useful through SSH tunnels.
+    turn_realm: "cyberverse"
+    turn_username: "cyberverse"
+    turn_password: "${TURN_PASSWORD}"
+    ice_public_ip: "" # REQUIRED for remote Direct WebRTC: public hostname or IP (not 127.0.0.1). Used in turn:HOST:PORT sent to browsers.
+
+recording:
+    # Enables per-turn MP4, raw WAV, and transcript files.
+    enabled: true
+    # Used when a session has no character-specific recording directory.
+    # Character sessions are stored under data/characters/.../sessions/...
+    output_dir: "./recordings"
+    # x264 CRF. Lower means higher quality and larger files.
+    crf: 23
+
+inference_grpc:
+    addr: "localhost:50051"

@@ -1,0 +1,68 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Noto+Serif+SC:wght@400;500;600;700&display=swap');
+@import "tailwindcss";
+
+/* Design tokens as CSS custom properties */
+@theme {
+  --color-cv-base: #181818;
+  --color-cv-surface: #202020;
+  --color-cv-elevated: #282828;
+  --color-cv-hover: #2E2E2E;
+  --color-cv-accent: #6BAF8D;
+  --color-cv-accent-hover: #8BCBA8;
+  --color-cv-accent-muted: #1E3A2A;
+  --color-cv-accent-glow: rgba(107, 175, 141, 0.15);
+  --color-cv-success: #6BAF8D;
+  --color-cv-success-muted: #1E3A2A;
+  --color-cv-warning: #C9A84C;
+  --color-cv-warning-muted: #2D2510;
+  --color-cv-danger: #C23B22;
+  --color-cv-danger-muted: #2D1515;
+  --color-cv-text: #F5F0E8;
+  --color-cv-text-secondary: #9E9E9E;
+  --color-cv-text-muted: #666666;
+  --color-cv-border: #333333;
+  --color-cv-border-subtle: #2A2A2A;
+
+  /* Scenic palette */
+  --color-scenic-zhu: #C23B22;
+  --color-scenic-ink: #1C1C1C;
+  --color-scenic-xuan: #F5F0E8;
+  --color-scenic-celadon: #6BAF8D;
+  --color-scenic-gold: #C9A84C;
+
+  /* Cyber theme colors (kept for backward compat) */
+  --color-cyber-base: #040507;
+  --color-cyber-cyan: #34e6f3;
+  --color-cyber-cyan-glow: rgba(52, 230, 243, 0.42);
+  --color-cyber-rose: #ff5f89;
+  --color-cyber-rose-glow: rgba(255, 95, 137, 0.34);
+  --color-cyber-text: #fbf6ef;
+  --color-cyber-surface: #090b10;
+  --color-cyber-muted: #6a7280;
+  --color-cyber-label: #8dcdd2;
+  --color-cyber-border: rgba(61, 68, 81, 0.82);
+}
+
+/* Base styles */
+body {
+  font-family: 'Inter', 'Noto Serif SC', system-ui, -apple-system, sans-serif;
+  background: var(--color-cv-base);
+  color: var(--color-cv-text);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-cv-border);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-cv-text-muted);
+}

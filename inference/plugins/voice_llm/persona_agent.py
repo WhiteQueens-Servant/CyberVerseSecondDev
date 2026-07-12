@@ -1,0 +1,763 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+from dataclasses import replace
+from typing import Any, AsyncIterator
+
+from inference.core.registry import import_plugin_class
+from inference.core.types import (
+    PluginConfig,
+    ToolCall,
+    ToolDefinition,
+    ToolResult,
+    VoiceLLMInputEvent,
+    VoiceLLMOutputEvent,
+    VoiceLLMSessionConfig,
+)
+from inference.plugins.voice_llm.base import VoiceLLMPlugin
+from inference.plugins.voice_llm.persona.runtime import LocalTaskRuntime
+from inference.plugins.voice_llm.persona.supervisor import PendingSubAgentTask, PersonaSupervisor, SupervisorToolResult
+from inference.rag import RAGEngine, RAGSearchRequest
+
+logger = logging.getLogger(__name__)
+
+
+PERSONA_TOOL_DEFINITIONS = [
+    ToolDefinition(
+        name="create_task",
+        description="为搜索、调研、聚合或报告类请求创建 CyberVerse 后台任务。",
+        parameters={
+            "type": "object",
+            "properties": {
+                "description": {
+                    "type": "string",
+                    "description": "用自然语言描述需要后台 SubAgent 完成的任务。不要拆解工具、类型或执行参数。",
+                },
+            },
+            "required": ["description"],
+        },
+    ),
+    ToolDefinition(
+        name="get_task_status",
+        description="获取当前会话中最新活跃的 CyberVerse 后台任务状态。",
+        parameters={"type": "object", "properties": {}},
+    ),
+    ToolDefinition(
+        name="cancel_task",
+        description="取消当前会话中最新活跃的 CyberVerse 后台任务。",
+        parameters={"type": "object", "properties": {}},
+    ),
+    ToolDefinition(
+        name="retrieve_character_knowledge",
+        description="当用户询问当前角色的知识库、导入文档或人物生平事实时使用；先检索再回答。",
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "用于检索角色素材库的具体问题或关键词。",
+                },
+            },
+            "required": ["query"],
+        },
+    ),
+    ToolDefinition(
+        name="get_attractions",
+        description="获取景区当前开放的景点列表。可按分类筛选。",
+        parameters={
+            "type": "object",
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "description": "景点分类筛选，如“历史”、“自然”、“亲子”。不填则返回全部。",
+                },
+            },
+        },
+    ),
+    ToolDefinition(
+        name="get_routes",
+        description="获取景区推荐游览路线列表，包含途经景点和预计时长。",
+        parameters={"type": "object", "properties": {}},
+    ),
+    ToolDefinition(
+        name="get_attraction_detail",
+        description="获取单个景点的详细信息，包括描述、开放时间、标签等。",
+        parameters={
+            "type": "object",
+            "properties": {
+                "attraction_id": {
+                    "type": "string",
+                    "description": "景点 ID。",
+                },
+            },
+            "required": ["attraction_id"],
+        },
+    ),
+]
+
+PERSONA_AGENT_INSTRUCTIONS = """你是 CyberVerse 数字人 PersonaAgent，直接通过语音和用户对话。
+你需要直接判断并处理用户当前表达。
+普通寒暄、问答和闲聊：直接自然回答。
+表达不清或缺少必要信息：用一句自然追问澄清，不要调用工具。
+搜索、查询热点、查询知乎热榜、调研、整理资料、生成报告、生成网页或需要较长后台处理：必须调用 create_task，不要只用口头承诺代替工具调用。
+当用户已经给出明确可执行的指令时，不能再追问领域、方向、范围、偏好或”想看哪些方面”；直接调用 create_task 执行。
+“看一下今天知乎热榜””帮我查一下知乎新鲜事””用知乎搜索一下宇树科技”这类请求已经足够明确，必须直接创建任务。
+调用 create_task 时只填写 description，用自然语言描述后台任务；不要决定任务类型、标题或具体工具参数。
+调用 create_task 后，最多用一句很短的确认，例如”好的，我去查。”不要做空泛等待播报、不要承诺很快返回结果、不要再追加问题。
+询问后台任务进度：调用 get_task_status。
+要求取消、停止、不用继续当前后台任务：调用 cancel_task。
+询问当前角色的导入知识、文档内容、经历、生平或背景事实：必须先调用 retrieve_character_knowledge；如果没有检索结果，再说明资料库里没有找到相关信息。
+用户询问景区有什么景点、哪里好玩、有什么推荐：调用 get_attractions 获取景点列表后回答。
+用户询问游览路线、怎么走、行程推荐：调用 get_routes 获取路线信息后回答。
+用户询问某个具体景点的详情、开放时间、介绍：先获取景点列表找到对应 ID，再调用 get_attraction_detail。
+
+【重要】当工具返回结果中包含 scenic_cards 字段时，你必须在回复末尾原样附带以下 JSON 块（不要修改、省略或重新格式化）：
+<!--SCENIC_CARD_JSON
+{ “scenic_cards”: [工具返回的 scenic_cards 原始数据] }
+SCENIC_CARD_JSON-->
+这个 JSON 块用于前端渲染结构化卡片，务必完整保留。
+"""
+
+
+class PersonaAgentPlugin(VoiceLLMPlugin):
+    """LangGraph-backed persona wrapper for an underlying realtime omni provider.
+
+    The public gRPC wire shape remains the existing VoiceLLM stream. Native tool
+    calls are consumed inside this wrapper and are never forwarded to Go or the UI.
+    """
+
+    name = "persona.persona"
+
+    def __init__(self) -> None:
+        self.model_provider = "doubao"
+        self.model_plugin: VoiceLLMPlugin | None = None
+        self.task_runtime: LocalTaskRuntime | None = None
+        self.supervisor: PersonaSupervisor | None = None
+        self.rag_engine: RAGEngine | None = None
+        self.checkpoint_db_path = ""
+        self.task_poll_interval_seconds = 1.0
+        self.task_monitor_timeout_seconds = 1800.0
+
+    async def initialize(self, config: PluginConfig) -> None:
+        self.model_provider = str(config.params.get("model_provider") or "doubao").strip()
+        if not self.model_provider or self.model_provider == "persona":
+            raise ValueError("persona model_provider must reference a concrete omni provider")
+
+        self.checkpoint_db_path = str(
+            config.params.get("checkpoint_db_path")
+            or os.getenv("LANGGRAPH_CHECKPOINT_DB")
+            or os.path.join(
+                os.getenv("CYBERVERSE_CONFIG_DIR", "."),
+                "data",
+                "tasks",
+                "langgraph_checkpoints.db",
+            )
+        )
+        self.task_poll_interval_seconds = max(
+            0.1,
+            float(config.params.get("task_poll_interval_seconds") or self.task_poll_interval_seconds),
+        )
+        self.task_monitor_timeout_seconds = max(
+            1.0,
+            float(config.params.get("task_monitor_timeout_seconds") or self.task_monitor_timeout_seconds),
+        )
+
+        omni_config = config.shared.get("omni", {})
+        if not isinstance(omni_config, dict):
+            raise ValueError("persona provider requires shared omni config")
+        provider_conf = omni_config.get(self.model_provider)
+        if not isinstance(provider_conf, dict):
+            raise ValueError(f"persona model_provider {self.model_provider!r} is not configured")
+        class_path = provider_conf.get("plugin_class")
+        if not class_path:
+            raise ValueError(f"persona model_provider {self.model_provider!r} has no plugin_class")
+
+        plugin_cls = import_plugin_class(str(class_path))
+        model_plugin = plugin_cls()
+        params = {k: v for k, v in provider_conf.items() if k != "plugin_class"}
+        await model_plugin.initialize(
+            PluginConfig(
+                plugin_name=f"omni.{self.model_provider}",
+                params=params,
+                shared=config.shared,
+            )
+        )
+        if not isinstance(model_plugin, VoiceLLMPlugin):
+            raise TypeError(f"{class_path} is not a VoiceLLMPlugin")
+        self.model_plugin = model_plugin
+
+        runtime_config = config.shared.get("runtime_config")
+        if not isinstance(runtime_config, dict):
+            runtime_config = {
+                "inference": {
+                    "llm": config.shared.get("llm", {}),
+                    "persona_agent": config.params,
+                }
+            }
+        self.rag_engine = RAGEngine(runtime_config)
+        self.task_runtime = LocalTaskRuntime(
+            runtime_config=runtime_config,
+            max_active_tasks_per_session=int(config.params.get("max_active_tasks_per_session") or 3),
+        )
+        self.supervisor = PersonaSupervisor(
+            runtime=self.task_runtime,
+            checkpoint_db_path=self.checkpoint_db_path,
+            task_poll_interval_seconds=self.task_poll_interval_seconds,
+            task_monitor_timeout_seconds=self.task_monitor_timeout_seconds,
+        )
+        await self.supervisor.initialize()
+
+    async def shutdown(self) -> None:
+        if self.model_plugin is not None:
+            await self.model_plugin.shutdown()
+        if self.supervisor is not None:
+            await self.supervisor.shutdown()
+            self.supervisor = None
+
+    async def check_voice(self, session_config: VoiceLLMSessionConfig | None = None) -> None:
+        if self.model_plugin is None:
+            raise RuntimeError("persona model plugin is not initialized")
+        await self.model_plugin.check_voice(session_config)
+
+    async def interrupt(self) -> None:
+        if self.model_plugin is not None:
+            await self.model_plugin.interrupt()
+
+    async def _retrieve_character_knowledge(
+        self,
+        call: ToolCall,
+        session_config: VoiceLLMSessionConfig,
+    ) -> SupervisorToolResult:
+        query = self._clean_text((call.arguments or {}).get("query")) or self._clean_text(
+            (call.arguments or {}).get("text")
+        )
+        if not query:
+            return SupervisorToolResult(result={"ok": False, "results": [], "error": "query is required"})
+        if not session_config.character_dir:
+            return SupervisorToolResult(result={"ok": True, "results": [], "reason": "character_dir_missing"})
+        if self.rag_engine is None:
+            return SupervisorToolResult(result={"ok": False, "results": [], "error": "rag engine is not initialized"})
+
+        results = await self.rag_engine.search(
+            RAGSearchRequest(
+                character_id=session_config.character_id,
+                character_dir=session_config.character_dir,
+                query=query,
+            )
+        )
+        return SupervisorToolResult(
+            result={
+                "ok": True,
+                "query": query,
+                "results": [
+                    {
+                        "source_id": item.source_id,
+                        "title": item.title,
+                        "filename": item.filename,
+                        "content": item.content,
+                        "score": item.score,
+                    }
+                    for item in results
+                ],
+            }
+        )
+
+    @staticmethod
+    def _format_rag_response_instructions(query: str, results: list[dict[str, Any]]) -> str:
+        lines = [
+            "请回答用户刚才的问题。下列内容来自当前角色素材库；如果与问题相关，必须优先依据这些素材回答；如果无关，请忽略它们。",
+            f"用户问题：{query}",
+            "【角色素材检索结果】",
+        ]
+        for idx, item in enumerate(results, 1):
+            title = str(item.get("title") or item.get("filename") or f"素材{idx}").strip()
+            content = str(item.get("content") or "").strip()
+            if not content:
+                continue
+            lines.append(f"[{idx}] {title}\n{content}")
+        lines.append("不要提到内部检索过程。不要编造素材中没有的事实。")
+        return "\n\n".join(lines)
+
+    async def _rag_response_instructions(
+        self,
+        text: str,
+        session_config: VoiceLLMSessionConfig,
+    ) -> str:
+        result = await self._retrieve_character_knowledge(
+            ToolCall(
+                id="persona_rag_pre_response",
+                name="retrieve_character_knowledge",
+                arguments={"query": text},
+            ),
+            session_config,
+        )
+        results = result.result.get("results")
+        if not isinstance(results, list) or not results:
+            logger.info(
+                "persona RAG pre-response no results session=%s query=%s",
+                session_config.session_id or "",
+                self._clip_text(text),
+            )
+            return ""
+        logger.info(
+            "persona RAG pre-response hit session=%s query=%s results=%d",
+            session_config.session_id or "",
+            self._clip_text(text),
+            len(results),
+        )
+        return self._format_rag_response_instructions(text, results)
+
+    @staticmethod
+    def _go_api_base() -> str:
+        return os.getenv("GO_API_BASE", "http://localhost:8080").rstrip("/")
+
+    async def _go_api_get(self, path: str) -> dict[str, Any]:
+        import httpx
+
+        url = f"{self._go_api_base()}{path}"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            return resp.json()
+
+    async def _get_attractions(
+        self,
+        call: ToolCall,
+        session_config: VoiceLLMSessionConfig,
+    ) -> SupervisorToolResult:
+        args = call.arguments or {}
+        category = self._clean_text(args.get("category"))
+        try:
+            path = "/api/v1/attractions"
+            if category:
+                path += f"?category={category}"
+            data = await self._go_api_get(path)
+            attractions = data if isinstance(data, list) else data.get("attractions", [])
+            scenic_cards = []
+            for a in attractions:
+                scenic_cards.append({
+                    "type": "attraction",
+                    "id": a.get("id", ""),
+                    "name": a.get("name", ""),
+                    "category": a.get("category", ""),
+                    "description": (a.get("description") or "")[:120],
+                    "location": a.get("location", ""),
+                    "tags": a.get("tags") or [],
+                })
+            result: dict[str, Any] = {"ok": True, "attractions": attractions}
+            if scenic_cards:
+                result["scenic_cards"] = scenic_cards
+            return SupervisorToolResult(result=result)
+        except Exception as exc:
+            logger.warning("get_attractions failed: %s", exc)
+            return SupervisorToolResult(result={"ok": False, "error": "暂时无法获取景点信息，请稍后再试。"})
+
+    async def _get_routes(
+        self,
+        call: ToolCall,
+        session_config: VoiceLLMSessionConfig,
+    ) -> SupervisorToolResult:
+        try:
+            data = await self._go_api_get("/api/v1/routes")
+            routes = data if isinstance(data, list) else data.get("routes", [])
+            scenic_cards = []
+            for r in routes:
+                steps = []
+                for s in r.get("steps") or []:
+                    steps.append({
+                        "attraction_name": s.get("attraction_name") or s.get("name", ""),
+                        "duration_minutes": s.get("duration_minutes", 0),
+                        "highlight": (s.get("highlight") or "")[:100],
+                    })
+                scenic_cards.append({
+                    "type": "route",
+                    "id": r.get("id", ""),
+                    "name": r.get("name", ""),
+                    "duration_minutes": r.get("duration_minutes", 0),
+                    "difficulty": r.get("difficulty", ""),
+                    "description": (r.get("description") or "")[:120],
+                    "steps": steps,
+                })
+            result: dict[str, Any] = {"ok": True, "routes": routes}
+            if scenic_cards:
+                result["scenic_cards"] = scenic_cards
+            return SupervisorToolResult(result=result)
+        except Exception as exc:
+            logger.warning("get_routes failed: %s", exc)
+            return SupervisorToolResult(result={"ok": False, "error": "暂时无法获取路线信息，请稍后再试。"})
+
+    async def _get_attraction_detail(
+        self,
+        call: ToolCall,
+        session_config: VoiceLLMSessionConfig,
+    ) -> SupervisorToolResult:
+        args = call.arguments or {}
+        attraction_id = self._clean_text(args.get("attraction_id"))
+        if not attraction_id:
+            return SupervisorToolResult(result={"ok": False, "error": "attraction_id is required"})
+        try:
+            data = await self._go_api_get(f"/api/v1/attractions/{attraction_id}")
+            return SupervisorToolResult(result={"ok": True, "attraction": data})
+        except Exception as exc:
+            logger.warning("get_attraction_detail failed: %s", exc)
+            return SupervisorToolResult(result={"ok": False, "error": "暂时无法获取景点详情，请稍后再试。"})
+
+    async def _execute_tool(
+        self,
+        call: ToolCall,
+        session_config: VoiceLLMSessionConfig,
+    ) -> SupervisorToolResult:
+        name = call.name.strip()
+        if name == "retrieve_character_knowledge":
+            return await self._retrieve_character_knowledge(call, session_config)
+        if name == "get_attractions":
+            return await self._get_attractions(call, session_config)
+        if name == "get_routes":
+            return await self._get_routes(call, session_config)
+        if name == "get_attraction_detail":
+            return await self._get_attraction_detail(call, session_config)
+        if self.supervisor is None:
+            raise RuntimeError("persona supervisor is not initialized")
+        return await self.supervisor.handle_tool_call(call, session_config.session_id)
+
+    @staticmethod
+    def _clean_text(text: Any) -> str:
+        return str(text or "").strip()
+
+    @staticmethod
+    def _needs_space(left: str, right: str) -> bool:
+        if not left or not right:
+            return False
+        return left[-1].isascii() and right[0].isascii() and left[-1].isalnum() and right[0].isalnum()
+
+    @classmethod
+    def _merge_text_segments(cls, segments: list[str]) -> str:
+        merged = ""
+        for segment in segments:
+            text = cls._clean_text(segment)
+            if not text:
+                continue
+            if not merged:
+                merged = text
+                continue
+            if text in merged:
+                continue
+            if merged in text:
+                merged = text
+                continue
+            separator = " " if cls._needs_space(merged, text) else ""
+            merged = f"{merged}{separator}{text}"
+        return merged.strip()
+
+    @classmethod
+    def _final_user_text(
+        cls,
+        call: ToolCall,
+        turn_transcripts: list[str],
+    ) -> str:
+        args = call.arguments or {}
+        tool_text = cls._clean_text(
+            args.get("description")
+            or args.get("user_request")
+            or args.get("request")
+            or args.get("text")
+        )
+        return tool_text or cls._merge_text_segments(turn_transcripts)
+
+    @staticmethod
+    def _has_assistant_output(event: VoiceLLMOutputEvent) -> bool:
+        return bool(event.transcript or event.audio or event.is_final)
+
+    @staticmethod
+    def _clip_text(value: Any, limit: int = 180) -> str:
+        text = str(value or "")
+        if len(text) <= limit:
+            return text
+        return text[:limit] + "..."
+
+    @classmethod
+    def _tool_calls_for_log(cls, calls: list[ToolCall]) -> list[dict[str, Any]]:
+        logged: list[dict[str, Any]] = []
+        for call in calls:
+            args = call.arguments or {}
+            logged.append(
+                {
+                    "id": call.id,
+                    "name": call.name,
+                    "arguments": cls._clip_text(json.dumps(args, ensure_ascii=False, sort_keys=True)),
+                }
+            )
+        return logged
+
+    @classmethod
+    def _model_event_kind(cls, event: VoiceLLMOutputEvent) -> str:
+        if event.tool_calls:
+            return "tool_call"
+        if event.user_transcript:
+            return "user_transcript"
+        if event.barge_in:
+            return "turn_started"
+        if event.is_final:
+            return "assistant_final"
+        if event.transcript:
+            return "assistant_delta"
+        if event.audio is not None:
+            return "audio_delta"
+        return "event"
+
+    @classmethod
+    def _log_model_event(cls, session_id: str, event: VoiceLLMOutputEvent) -> None:
+        kind = cls._model_event_kind(event)
+        audio = event.audio
+        fields: dict[str, Any] = {
+            "question_id": event.question_id,
+            "reply_id": event.reply_id,
+            "is_final": event.is_final,
+            "barge_in": event.barge_in,
+        }
+        if event.user_transcript:
+            fields["user_transcript"] = cls._clip_text(event.user_transcript)
+        if event.transcript:
+            fields["transcript"] = cls._clip_text(event.transcript)
+        if audio is not None:
+            fields["audio"] = {
+                "bytes": len(audio.data or b""),
+                "sample_rate": audio.sample_rate,
+                "is_final": audio.is_final,
+            }
+        if event.tool_calls:
+            fields["tool_calls"] = cls._tool_calls_for_log(event.tool_calls)
+        info_kinds = {"turn_started", "user_transcript", "tool_call", "assistant_final"}
+        log = logger.info if kind in info_kinds else logger.debug
+        log(
+            "persona model event session=%s kind=%s fields=%s",
+            session_id or "",
+            kind,
+            json.dumps(fields, ensure_ascii=False, sort_keys=True),
+        )
+
+    @staticmethod
+    def _task_event_payload(task: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "type": "task_event",
+            "task_id": event.get("task_id") or task.get("id"),
+            "session_id": task.get("session_id"),
+            "seq": event.get("seq"),
+            "event_type": event.get("event_type"),
+            "status": event.get("status") or task.get("status"),
+            "message": event.get("message") or "",
+            "progress": event.get("progress", task.get("progress", 0)),
+            "created_at": event.get("created_at"),
+            "task": task,
+        }
+        event_payload = event.get("payload")
+        if isinstance(event_payload, str):
+            try:
+                event_payload = json.loads(event_payload)
+            except json.JSONDecodeError:
+                event_payload = {}
+        if isinstance(event_payload, dict) and event_payload:
+            payload["payload"] = event_payload
+        return payload
+
+    @staticmethod
+    def _drain_task_events(queue: asyncio.Queue[dict[str, Any]]) -> list[dict[str, Any]]:
+        drained: list[dict[str, Any]] = []
+        while True:
+            try:
+                drained.append(queue.get_nowait())
+            except asyncio.QueueEmpty:
+                return drained
+
+    async def _run_async_task(
+        self,
+        pending: PendingSubAgentTask,
+        injected: asyncio.Queue[VoiceLLMInputEvent],
+    ) -> None:
+        if self.supervisor is None:
+            raise RuntimeError("persona supervisor is not initialized")
+        prompt = await self.supervisor.run_pending_task(pending)
+        await injected.put(VoiceLLMInputEvent(text=prompt))
+
+    @staticmethod
+    def _persona_system_prompt(session_config: VoiceLLMSessionConfig) -> str:
+        prompt = (session_config.system_prompt or "").strip()
+        if not prompt:
+            return PERSONA_AGENT_INSTRUCTIONS
+        return f"{PERSONA_AGENT_INSTRUCTIONS}\n\n角色设定：\n{prompt}"
+
+    async def _merged_input_stream(
+        self,
+        input_stream: AsyncIterator[VoiceLLMInputEvent],
+        injected: asyncio.Queue[VoiceLLMInputEvent],
+    ) -> AsyncIterator[VoiceLLMInputEvent]:
+        source = input_stream.__aiter__()
+        source_done = False
+        while True:
+            try:
+                while True:
+                    yield injected.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+
+            if source_done:
+                try:
+                    yield await asyncio.wait_for(injected.get(), timeout=0.2)
+                    continue
+                except asyncio.TimeoutError:
+                    return
+
+            try:
+                yield await source.__anext__()
+            except StopAsyncIteration:
+                source_done = True
+
+    async def converse_stream(
+        self,
+        input_stream: AsyncIterator[VoiceLLMInputEvent],
+        session_config: VoiceLLMSessionConfig | None = None,
+    ) -> AsyncIterator[VoiceLLMOutputEvent]:
+        if self.model_plugin is None:
+            raise RuntimeError("persona model plugin is not initialized")
+        session_config = session_config or VoiceLLMSessionConfig()
+        model_session_config = replace(
+            session_config,
+            system_prompt=self._persona_system_prompt(session_config),
+            tools=PERSONA_TOOL_DEFINITIONS,
+            defer_response=True,
+        )
+        injected: asyncio.Queue[VoiceLLMInputEvent] = asyncio.Queue()
+        turn_transcripts: list[str] = []
+        pending_task_starts: list[PendingSubAgentTask] = []
+        background_tasks: set[asyncio.Task[None]] = set()
+        task_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        remove_task_event_listener = None
+
+        def enqueue_task_event(task: dict[str, Any], event: dict[str, Any]) -> None:
+            if str(task.get("session_id") or "") != str(session_config.session_id or ""):
+                return
+            task_events.put_nowait(self._task_event_payload(task, event))
+
+        if hasattr(self.task_runtime, "add_event_listener"):
+            remove_task_event_listener = self.task_runtime.add_event_listener(enqueue_task_event)  # type: ignore[union-attr]
+
+        def schedule_task_start(pending: PendingSubAgentTask) -> None:
+            task = asyncio.create_task(self._run_async_task(pending, injected))
+            background_tasks.add(task)
+            task.add_done_callback(background_tasks.discard)
+
+        model_event_task: asyncio.Task[VoiceLLMOutputEvent] | None = None
+        task_event_task: asyncio.Task[dict[str, Any]] | None = None
+        try:
+            model_events = self.model_plugin.converse_stream(
+                self._merged_input_stream(input_stream, injected),
+                session_config=model_session_config,
+            ).__aiter__()
+            model_event_task = asyncio.create_task(model_events.__anext__())
+            task_event_task = asyncio.create_task(task_events.get())
+
+            while model_event_task is not None:
+                wait_set = {model_event_task}
+                if task_event_task is not None:
+                    wait_set.add(task_event_task)
+                done, _pending = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
+
+                if task_event_task is not None and task_event_task in done:
+                    yield VoiceLLMOutputEvent(task_event=task_event_task.result())
+                    for payload in self._drain_task_events(task_events):
+                        yield VoiceLLMOutputEvent(task_event=payload)
+                    task_event_task = asyncio.create_task(task_events.get())
+                    if model_event_task not in done:
+                        continue
+
+                if model_event_task not in done:
+                    continue
+
+                try:
+                    event = model_event_task.result()
+                except StopAsyncIteration:
+                    model_event_task = None
+                    break
+
+                self._log_model_event(session_config.session_id, event)
+                if event.user_transcript:
+                    user_text = event.user_transcript
+                    turn_transcripts.append(user_text)
+                    yield VoiceLLMOutputEvent(
+                        user_transcript=user_text,
+                        question_id=event.question_id,
+                        reply_id=event.reply_id,
+                    )
+                    try:
+                        response_instructions = await self._rag_response_instructions(user_text, session_config)
+                    except Exception:
+                        logger.exception("persona RAG pre-response failed")
+                        response_instructions = ""
+                    await injected.put(VoiceLLMInputEvent(response_instructions=response_instructions))
+                    event = replace(event, user_transcript="")
+                    if not event.tool_calls and not event.barge_in and not self._has_assistant_output(event):
+                        model_event_task = asyncio.create_task(model_events.__anext__())
+                        continue
+
+                if event.tool_calls:
+                    for call in event.tool_calls:
+                        name = call.name.strip()
+                        final_user_text = self._final_user_text(call, turn_transcripts)
+                        effective_call = call
+                        if name == "create_task" and final_user_text:
+                            args = dict(call.arguments or {})
+                            args["description"] = final_user_text
+                            effective_call = ToolCall(id=call.id, name=call.name, arguments=args)
+                        turn_transcripts.clear()
+
+                        try:
+                            tool_result = await self._execute_tool(effective_call, session_config)
+                            if tool_result.pending_task is not None:
+                                pending_task_starts.append(tool_result.pending_task)
+                            result = tool_result.result
+                        except Exception as exc:
+                            logger.exception("persona tool call failed: %s", call.name)
+                            result = {"ok": False, "error": str(exc)}
+                        await injected.put(
+                            VoiceLLMInputEvent(
+                                tool_result=ToolResult(
+                                    id=call.id,
+                                    name=call.name,
+                                    result=result,
+                                )
+                            )
+                        )
+                    for payload in self._drain_task_events(task_events):
+                        yield VoiceLLMOutputEvent(task_event=payload)
+                    model_event_task = asyncio.create_task(model_events.__anext__())
+                    continue
+
+                if self._has_assistant_output(event) and turn_transcripts:
+                    turn_transcripts.clear()
+                yield event
+
+                if event.is_final and pending_task_starts:
+                    starts = pending_task_starts[:]
+                    pending_task_starts.clear()
+                    for pending in starts:
+                        schedule_task_start(pending)
+                model_event_task = asyncio.create_task(model_events.__anext__())
+            for payload in self._drain_task_events(task_events):
+                yield VoiceLLMOutputEvent(task_event=payload)
+        finally:
+            for task in (model_event_task, task_event_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (model_event_task, task_event_task) if task is not None),
+                return_exceptions=True,
+            )
+            if remove_task_event_listener is not None:
+                remove_task_event_listener()
+            for task in background_tasks:
+                task.cancel()
+            if background_tasks:
+                await asyncio.gather(*background_tasks, return_exceptions=True)

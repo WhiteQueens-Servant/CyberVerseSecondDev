@@ -1,0 +1,37 @@
+syntax = "proto3";
+package cyberverse;
+
+option go_package = "github.com/cyberverse/server/internal/pb";
+
+import "common.proto";
+
+service TTSService {
+  rpc SynthesizeStream (stream TextChunk) returns (stream AudioChunk);
+  rpc ListVoices (ListVoicesRequest) returns (ListVoicesResponse);
+}
+
+message TextChunk {
+  string text = 1;
+  bool is_final = 2;
+  TTSConfig config = 3;
+}
+
+message TTSConfig {
+  string provider = 1;
+  string voice = 2;
+  string speaking_style = 3;
+  string language = 4;
+  string session_id = 5;
+}
+
+message ListVoicesRequest {}
+
+message ListVoicesResponse {
+  repeated VoiceInfo voices = 1;
+}
+
+message VoiceInfo {
+  string id = 1;
+  string name = 2;
+  string language = 3;
+}
